@@ -1,0 +1,24 @@
+services:
+  db:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile
+    image: gator-postgres
+    container_name: gator-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: gator
+    ports:
+      - "5432:5432"
+    volumes:
+      - gator_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d gator"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  gator_pgdata:
