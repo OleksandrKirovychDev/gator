@@ -7,11 +7,14 @@ import (
 	"fmt"
 	"html"
 	"log"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/OleksandrKirovychDev/gator/internal/database"
 	"github.com/OleksandrKirovychDev/gator/internal/rss"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 func handlerLogin(s *State, cmd Command) error {
@@ -112,10 +115,10 @@ func handlerAggregate(s *State, cmd Command) error {
 	}
 }
 
-// scrapeFeeds fetches the single feed that is most overdue for a refresh,
-// marks it as fetched, and prints the titles of its posts to the console.
 func scrapeFeeds(s *State) {
-	feed, err := s.dbQueries.GetNextFeedToFetch(context.Background())
+	ctx := context.Background()
+
+	feed, err := s.dbQueries.GetNextFeedToFetch(ctx)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			log.Println("no feeds to fetch")
@@ -125,22 +128,77 @@ func scrapeFeeds(s *State) {
 		return
 	}
 
-	if err := s.dbQueries.MarkFeedFetched(context.Background(), feed.ID); err != nil {
+	if err := s.dbQueries.MarkFeedFetched(ctx, feed.ID); err != nil {
 		log.Printf("failed to mark feed '%s' as fetched: %v", feed.Name, err)
 		return
 	}
 
-	rssFeed, err := rss.FetchFeed(context.Background(), feed.Url)
+	rssFeed, err := rss.FetchFeed(ctx, feed.Url)
 	if err != nil {
 		log.Printf("failed to fetch feed '%s' (%s): %v", feed.Name, feed.Url, err)
 		return
 	}
 
-	fmt.Printf("Collecting feed '%s' (%s)\n", feed.Name, feed.Url)
+	saved := 0
 	for _, item := range rssFeed.Channel.Item {
-		fmt.Printf(" - %s\n", html.UnescapeString(item.Title))
+		err := s.dbQueries.CreatePost(ctx, database.CreatePostParams{
+			ID:          uuid.New(),
+			Title:       html.UnescapeString(item.Title),
+			Url:         item.Link,
+			Description: toNullString(html.UnescapeString(item.Description)),
+			PublishedAt: parsePublishedAt(item.PubDate),
+			FeedID:      feed.ID,
+		})
+		if err != nil {
+			if isUniqueViolation(err) {
+				continue
+			}
+			log.Printf("failed to save post '%s': %v", item.Link, err)
+			continue
+		}
+		saved++
 	}
-	fmt.Printf("Feed '%s' collected, %d posts found\n", feed.Name, len(rssFeed.Channel.Item))
+
+	log.Printf("feed '%s' collected: %d items, %d new post(s) saved", feed.Name, len(rssFeed.Channel.Item), saved)
+}
+
+func toNullString(s string) sql.NullString {
+	if s == "" {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: s, Valid: true}
+}
+
+func parsePublishedAt(raw string) sql.NullTime {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return sql.NullTime{}
+	}
+
+	layouts := []string{
+		time.RFC1123Z,
+		time.RFC1123,
+		time.RFC822Z,
+		time.RFC822,
+		time.RFC3339,
+		"Mon, 2 Jan 2006 15:04:05 -0700",
+		"2006-01-02T15:04:05Z",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return sql.NullTime{Time: t, Valid: true}
+		}
+	}
+
+	log.Printf("could not parse published date %q", raw)
+	return sql.NullTime{}
+}
+
+func isUniqueViolation(err error) bool {
+	var pqErr *pq.Error
+	return errors.As(err, &pqErr) && pqErr.Code == "23505"
 }
 
 func handlerAddFeed(s *State, cmd Command, user database.User) error {
@@ -243,6 +301,51 @@ func handlerUnfollowFeed(s *State, cmd Command, user database.User) error {
 	}
 
 	fmt.Printf("Successfully unfollowed feed '%s' with URL %s\n", feed.Name, feed.Url)
+	return nil
+}
+
+func handlerBrowse(s *State, cmd Command, user database.User) error {
+	limit := 2
+	if len(cmd.args) > 0 {
+		n, err := strconv.Atoi(cmd.args[0])
+		if err != nil {
+			return fmt.Errorf("invalid limit '%s': must be a number", cmd.args[0])
+		}
+		if n < 1 {
+			return fmt.Errorf("limit must be a positive number")
+		}
+		limit = n
+	}
+
+	posts, err := s.dbQueries.GetPostsForUser(context.Background(), database.GetPostsForUserParams{
+		UserID: user.ID,
+		Limit:  int32(limit),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to get posts: %w", err)
+	}
+
+	if len(posts) == 0 {
+		fmt.Println("No posts found. Follow some feeds and run `agg` to collect posts.")
+		return nil
+	}
+
+	fmt.Printf("Found %d post(s) for user %s:\n\n", len(posts), user.Name)
+	for _, post := range posts {
+		published := "unknown date"
+		if post.PublishedAt.Valid {
+			published = post.PublishedAt.Time.Format("Mon Jan 2, 2006")
+		}
+
+		fmt.Printf("%s · %s\n", published, post.FeedName)
+		fmt.Printf("  %s\n", post.Title)
+		fmt.Printf("  %s\n", post.Url)
+		if post.Description.Valid && strings.TrimSpace(post.Description.String) != "" {
+			fmt.Printf("  %s\n", post.Description.String)
+		}
+		fmt.Println("=====================================")
+	}
+
 	return nil
 }
 
